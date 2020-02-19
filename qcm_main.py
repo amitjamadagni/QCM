@@ -6,7 +6,7 @@ import random
 
 class Opt_Param():
 
-    def __init__(self, init_state, suc_sqg, suc_tqg, dephase_noise, depth, method):
+    def __init__(self, init_state, suc_sqg, suc_tqg, incoherent_noise, noise_prob, depth, method):
         if init_state == 'rand':
             rc = [random.random() for j in range(4)]
             init_state_1 = (rc[0]*ket("0") + rc[1]*ket("1")).unit()
@@ -16,8 +16,9 @@ class Opt_Param():
             self._init_state = init_state
         self._suc_sqg = suc_sqg
         self._suc_tqg = suc_tqg
+        self._incoherent_noise = incoherent_noise
+        self._noise_prob = noise_prob
         self._depth = depth
-        self._dephase_noise = dephase_noise
         self._method = method
 
     def R_x(self, p):
@@ -31,6 +32,9 @@ class Opt_Param():
 
     def Kraus_dephase(self, p):
         return np.sqrt(1-p)*qeye(2), np.sqrt(p)*sigmaz()
+
+    def Kraus_amp_damp(self, p):
+        return Qobj([[1, 0], [0, np.sqrt(1-p)]], dims=[[2], [2]]), Qobj([[0, np.sqrt(p)], [0, 0]], dims=[[2], [2]])
 
     # def gen_ghz_gate_noise(phi_l, init_state, rand_fixed_arr_sqg, rand_fixed_arr_tqg):
     def generate_noise_mat(self):
@@ -91,46 +95,65 @@ class Opt_Param():
                 else:
                     self._init_state = tensor(self.R_x(res.x[2]), self.R_y(res.x[3]))*self.CNOT()*tensor(self.R_y(res.x[0]), self.R_x(res.x[1]))*self._init_state
 
-    def rho_depolarizing_noise(self, phi_l):
+    def gen_incoherent_noise_mc(self, phi_l, ntraj):
         nmat =  self.generate_noise_mat()
-        rho = self._init_state.dag()*self._init_state
-        kops1 = self.Kraus_dephase(self._dephase_noise[0])
-        kops2 = self.Kraus_dephase(self._dephase_noise[1])
-        kcombs = [tensor(i, j) for i in kops1 for j in kops2]
-        rho = tensor(nmat[0]*self.R_y(phi_l[0]), nmat[1]*self.R_x(phi_l[1]))*rho*tensor(nmat[0]*self.R_y(phi_l[0]), nmat[1]*self.R_x(phi_l[1]))
-        for j in range(4):
-            rho = rho + kcombs[j]*rho*kcombs[j].dag()
-        rho = nmat[4]*self.CNOT()*rho*self.CNOT()*nmat[4]
-        rho = tensor(nmat[2]*self.R_x(phi_l[2]), nmat[3]*self.R_y(phi_l[3]))*rho*tensor(nmat[2]*self.R_x(phi_l[2]), nmat[3]*self.R_y(phi_l[3]))
-        for k in range(4):
-            rho = rho + kcombs[k]*rho*kcombs[k].dag()
-        return rho
-        # param_state = tensor(nmat[2]*self.R_x(phi_l[2]), nmat[3]*self.R_y(phi_l[3]))*nmat[4]*self.CNOT()*tensor(nmat[0]*self.R_y(phi_l[0]), nmat[1]*self.R_x(phi_l[1]))*self._init_state
 
-    def overlap_depolarizing_noise(self, phi_l):
-        rho = self.rho_depolarizing_noise(phi_l)
+        if self._incoherent_noise == 'amp_damp':
+            kops1 = self.Kraus_amp_damp(self._noise_prob[0])
+            kops2 = self.Kraus_amp_damp(self._noise_prob[1])
+        elif self._incoherent_noise == 'dephase':
+            kops1 = self.Kraus_amp_damp(self._noise_prob[0])
+            kops2 = self.Kraus_amp_damp(self._noise_prob[1])
+
+        kcombs = [tensor(i, j) for i in kops1 for j in kops2]
+        U1 = tensor(nmat[0]*self.R_y(phi_l[0]), nmat[1]*self.R_x(phi_l[1]))
+        state = self.CNOT()*U1*self._init_state
+
+        # MC traj
+        kraus_prob = [np.real((state.dag()*k_op.dag()*k_op*state).data.todense()[0, 0]) for k_op in kcombs]
+        prob_sum = np.sum(kraus_prob)
+        rho = 0*bra("00")*ket("00")
+        for traj in range(ntraj):
+            rand = random.random()
+            prob_jump = 0.
+            for j in range(4):
+                prob_jump = prob_jump + kraus_prob[j]/prob_sum
+                if prob_jump >= rand:
+                    # print(kraus_prob, prob_jump, rand, j)
+                    rho = rho + (kcombs[j]*state*state.dag()*kcombs[j].dag())/np.real(kraus_prob[j])
+                    break
+
+        rho = rho/float(ntraj)
+        U2 = tensor(nmat[2]*self.R_x(phi_l[2]), nmat[3]*self.R_y(phi_l[3]))
+        rho = U2*rho*U2.dag()
+        print(" trace : ", rho.tr())
+        return rho
+
+    def overlap_gen_noise_mc(self, phi_l, ntraj):
+        rho = self.gen_incoherent_noise_mc(phi_l, ntraj)
+        # print(" trace : ", rho.tr())
         ghz = (ket("00") + ket("11")).unit()
         ghz_rho = ghz.dag()*ghz
         ghz_rho_sq = ghz_rho.sqrtm()
         fid = -abs(((ghz_rho_sq*rho*ghz_rho_sq).sqrtm()).tr())**2
-        print("phi's : ", phi_l, " fidelity : ", fid)
+        # print("phi's : ", phi_l, " fidelity : ", fid)
         return fid
 
-    def expect_depolarizing_noise(self, phi_l):
-        rho = self.rho_depolarizing_noise(phi_l)
+    def expect_gen_noise_mc(self, phi_l, ntraj):
+        rho = self.gen_incoherent_noise_mc(phi_l, ntraj)
         h_gate = self.R_y(np.pi/2.)*self.R_x(-np.pi)*self.R_y(np.pi)
         # print("phi's : ", phi_l, " overlap : ", olap)
         return np.real(expect(tensor(h_gate, h_gate), rho))
 
-    def depolarizing_noisy_gates(self):
+    def gen_noisy_gates_mc(self):
         if self._method == 'overlap':
-            res = minimize(self.overlap_depolarizing_noise, [0., 0., 0., 0.], method='Nelder-Mead', tol=1e-6)
-            print(" Overlap : ", abs(res.fun))
+            res = minimize(self.overlap_gen_noise_mc, [0., 0., 0., 0.], args=(500), method='Nelder-Mead', tol=1e-6)
+            print(" Fidelity : ", abs(res.fun))
             print(" phi's : ", res.x)
             print("################")
             return abs(res.fun), res.x
         elif self._method == 'expect':
-            res = minimize(self.expect_depolarizing_noise, [0., 0., 0., 0.], method='Nelder-Mead', tol=1e-6)
+            res = minimize(self.expect_gen_noise_mc, [0., 0., 0., 0.], args=(500), method='Nelder-Mead', tol=1e-6)
             print(" Expectation : ", res.fun)
             print(" phi's : ", res.x)
             print("################")
@@ -160,15 +183,26 @@ def overlap_noisy_state_noisy_gates(single_qubit_gate_success_prob, two_qubit_ga
 def expect_noisy_state_noisy_gates(single_qubit_gate_success_prob, two_qubit_gate_success_prob, init_state='rand', depth=5):
     return Opt_Param(init_state, single_qubit_gate_success_prob, two_qubit_gate_success_prob, None, depth, 'expect').noisy_state_noisy_gates_depth()
 
-"""
-##################################################################################
-def overlap_depolarizing_noisy_gate():
-    return Opt_Param(ket("00"), [1., 1., 1., 1.], [1.], [0., 0.], 1, 'overlap').depolarizing_noisy_gates()
 
-print(overlap_depolarizing_noisy_gate())
+def overlap_dephasing_noisy_gate_mc(single_qubit_gate_success_prob, two_qubit_gate_success_prob, dephase_probs):
+    return Opt_Param(ket("00"), single_qubit_gate_success_prob, two_qubit_gate_success_prob, 'dephase', dephase_probs, None, 'overlap').gen_noisy_gates_mc()
 
-def expect_depolarizing_noisy_gate():
-    return Opt_Param(ket("00"), [1., 1., 1., 1.], [1.], [1., 1.], 1, 'expect').depolarizing_noisy_gates()
+# print(overlap_dephasing_noisy_gate_mc([0.8, .7, .6, .5], [0.5], [0.2, 0.88]))
+# print(overlap_dephasing_noisy_gate_mc([1., 1., 1., 1.], [1.], [1., 0.]))
 
-print(expect_depolarizing_noisy_gate())
-"""
+def expect_dephasing_noisy_gate_mc(single_qubit_gate_success_prob, two_qubit_gate_success_prob, dephase_probs):
+    return Opt_Param(ket("00"), single_qubit_gate_success_prob, two_qubit_gate_success_prob, 'dephase', dephase_probs, None, 'expect').gen_noisy_gates_mc()
+
+# print(overlap_dephasing_noisy_gate_mc([0.8, .7, .6, .5], [0.5], [0.2, 0.88]))
+# print(overlap_dephasing_noisy_gate_mc([1., 1., 1., 1.], [1.], [1., 0.]))
+
+def overlap_amp_damp_noisy_gate_mc(single_qubit_gate_success_prob, two_qubit_gate_success_prob, amp_damp_probs):
+    return Opt_Param(ket("00"), single_qubit_gate_success_prob, two_qubit_gate_success_prob, 'amp_damp', amp_damp_probs, None, 'overlap').gen_noisy_gates_mc()
+
+# print(overlap_dephasing_noisy_gate_mc([0.8, .7, .6, .5], [0.5], [0.2, 0.88]))
+# print(overlap_amp_damp_noisy_gate_mc([1., 1., 1., 1.], [1.], [1., 0.]))
+
+def expect_amp_damp_noisy_gate_mc(single_qubit_gate_success_prob, two_qubit_gate_success_prob, amp_damp_probs):
+    return Opt_Param(ket("00"), single_qubit_gate_success_prob, two_qubit_gate_success_prob, 'amp_damp', amp_damp_probs, None, 'expect').gen_noisy_gates_mc()
+
+## print(expect_amp_damp_noisy_gate_mc([0.8, .7, .6, .5], [0.5], [0.2, 0.88]))
